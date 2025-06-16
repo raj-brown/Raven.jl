@@ -11,9 +11,11 @@
 # ```
 #
 #jl #FIXME: optimize kernels
+#       - data trasfer kernel
+#jl     - recursion kernel
 #jl #FIXME: add introduction to dirac equation latex
 #--------------------------------Markdown Language Header-----------------------
-using Base: sign_mask
+using Base: sign_mask, specializations
 using Adapt
 using MPI
 using CUDA
@@ -26,28 +28,35 @@ using StaticArrays
 using WriteVTK
 
 using MAT
+using NVTX
+using SpecialFunctions
 
 import Base.abs2
 
-const convergetest = true
+const convergetest = false
 const empericalconvergetest = false
-const outputvtk = false
+const outputvtk = true
 const numlevels = 3
 const Lout = 2
-const m = 20.0
-const matpar = :half # options: :const :half :smooth
+const m = -5.0
 const BC = :crbc # options: :crbc :forbc :reflect :periodic
 const flux = :upwind    # options: :upwind :central
-const datatype = :crbc # options: :crbc :synthetic :none
+const datatype = :crbc  # options: :crbc :synthetic :none
+const matcoef = :disc   # options: :disc :cont
+#const f(x,y) = y > 0 ? m : -m                   # disc_h
+const f(x,y) = x > 0 ? m : -m                  # disc_v
+#const f(x,y) = m*(erf(10*y+3)-erf(10*y-3)-1)   # double
+#const f(x,y) = m*y                             # y
+#const f(x,y) = m*erf(m*y)                      # erf in y
+#const f(x,y) = m*erf(m*x)                      # erf in x
 const K = 16
 const delta_x = 1.0
 const delta_y = 1.0
-const timeend = 5.0
+const timeend = 1.2
 const N = (4, 4)
 
 BC == :crbc && @assert datatype == :crbc
 datatype == :synthetic && @assert BC == :forbc
-
 
 const progresswidth = 30
 #const ħ = 1
@@ -56,37 +65,39 @@ function abs2(v::SVector{2,ComplexF64})
     return abs(real(conj(v)' * v))
 end
 
-# Gaussian initial condition
-function initialgaussian(x::SVector{2})
-    FT = eltype(x)
-    CT = Complex{FT}
+@kernel function gaussian!(
+    q,
+    mesh,
+    ::Val{N}
+) where {N}
+    i, j, _ = @index(Local, NTuple)
+    _, _, c = @index(Global, NTuple)
+
+    x = mesh[i, j, c]
+    qvec = SVector{2, eltype(eltype(q))}(1,1)
     b = 0.1
-    a = 0.00
-    smooth = exp(-((x[1] / b)^2 + ((x[2] - a) / b)^2))
-    return smooth .* SVector{2,CT}(1, 1)
+        temp = exp(-(x[1]/b)^2 - (x[2]/b)^2)
+    q[i, j, c] = temp*qvec
 end
 
-function exactwithinterface(x::SVector{2}, m, t)
-    FT = eltype(x)
-    CT = Complex{FT}
-    k = 10 * π
+@kernel function exactwithinterface!(
+    q,
+    mesh,
+    matparam,
+    t,
+    ::Val{N}
+) where {N}
+    i, j, _ = @index(Local, NTuple)
+    _, _, c = @index(Global, NTuple)
+
+    qvec = SVector{2, eltype(eltype(q))}(1,-1)
+    mat = matparam[i, j, c]
+    x = mesh[i, j, c]
+
+    k = 10*π
     w = -k
-    a = -m
-    temp = exp(im * k * (x[1] + t) + a * x[2])
-    return SVector{2,CT}(temp, temp * w / k)
-end
-
-function exactwithinterface(points, mvals, t)
-    @assert size(points) == size(mvals)
-    exact = similar(initialgaussian.(points))
-    for i = 1:size(points, 1)
-        for j = 1:size(points, 2)
-            for k = 1:size(points, 3)
-                exact[i, j, k] = exactwithinterface(points[i, j, k], mvals[i, j, k], t)
-            end
-        end
-    end
-    return exact
+    temp = exp(im*k*(x[1]+t)-mat*x[2])
+    q[i, j, c] = temp*qvec
 end
 
 # Exact solution without interface
@@ -109,7 +120,7 @@ end
     wJ,
     invwJ,
     DT,
-    m,
+    materialparams,
     ::Val{N},
     ::Val{C},
 ) where {N,C}
@@ -157,6 +168,7 @@ end
         dRdXijc = dRdX[i, j, c]
         wJijc = wJ[i, j, c]
         wJdRdXijc = wJijc * dRdXijc
+        matparamijc = materialparams[i, j, c]
 
         @unroll for m = 0x1:N[1]
             dqijc_update -= wJdRdXijc[1] * lDT1[i, m] * σ₁ * lU[m, j, c1] # -rₓDᵣσ₁u
@@ -166,7 +178,7 @@ end
             dqijc_update -= wJdRdXijc[2] * lDT2[j, n] * σ₁ * lU[i, n, c1] # -sₓDₛσ₁u
         end
 
-        dq[i, j, c] = invwJijc * dqijc_update - im * m * σ₃ * lU[i, j, c1]
+        dq[i, j, c] = invwJijc * dqijc_update - im * matparamijc * σ₃ * lU[i, j, c1]
     end
 end
 
@@ -176,7 +188,6 @@ end
     q,
     dqdtan,
     dwdn,
-    m,
     ::Val{N},
     ::Val{C},
 ) where {N,C}
@@ -198,7 +209,6 @@ end
     q,
     dqdtan,
     dwdn,
-    m,
     ::Val{N},
     ::Val{C},
 ) where {N,C}
@@ -564,22 +574,22 @@ end
     end
 end
 
-function coefmap!(materialparams, gridpoints, m)
+function coefmap!(materialparams, gridpoints, f)
     iMax, jMax, eMax = size(gridpoints)
-    if matpar == :half
+    if matcoef == :disc
         for e = 1:eMax
-            center = last.(gridpoints[[1, end], [1, end], e])[1, :]
-            avg = (center[1] + center[2]) / 2
-            mtemp = avg > 0 ? m : -m
+            x_temp = first.(gridpoints[[1, end], [1, end], e])[:, 1]
+            y_temp = last.(gridpoints[[1, end], [1, end], e])[1, :]
+            x_center = (x_temp[1] + x_temp[2]) / 2
+            y_center = (y_temp[1] + y_temp[2]) / 2
             for i = 1:iMax, j = 1:jMax
-                materialparams[i, j, e] = mtemp
+                materialparams[i, j, e] = f(x_center, y_center)
             end
         end
-    elseif matpar == :const
-        for e = 1:eMax
-            for i = 1:iMax, j = 1:jMax
-                materialparams[i, j, e] = m
-            end
+    elseif matcoef == :cont
+        for e = 1:eMax, i = 1:iMax, j = 1:jMax
+            x, y = gridpoints[i,j,e]
+            materialparams[i, j, e] = f(x,y)
         end
     end
 end
@@ -684,7 +694,7 @@ function crbc_recursion_top!(dwdn, dqdtan, q, grid, m, a, sig)
     return dwdn
 end
 
-function crbc_rhs!(dq, q, dwdn, dqdtan, grid, invwJ, DT, m, a, sig, cm; orient = "top")
+function crbc_rhs!(dq, q, dwdn, dqdtan, grid, invwJ, DT, materialparams, a, sig, cm; orient = "top")
     backend = Raven.get_backend(dq)
     cell = referencecell(grid)
     dRdX, _, wJ = components(first(volumemetrics(grid)))
@@ -699,7 +709,7 @@ function crbc_rhs!(dq, q, dwdn, dqdtan, grid, invwJ, DT, m, a, sig, cm; orient =
         wJ,
         invwJ,
         DT,
-        m,
+        materialparams,
         Val(size(cell)),
         Val(C);
         ndrange = size(dq),
@@ -721,7 +731,9 @@ function crbc_rhs!(dq, q, dwdn, dqdtan, grid, invwJ, DT, m, a, sig, cm; orient =
     )
 
     if orient == "top"
-        dwdn = crbc_recursion_top!(dwdn, dqdtan, q, grid, m, a, sig)
+        #FIXME: AHHHHH this is real bad
+        #dwdn = crbc_recursion_top!(dwdn, dqdtan, q, grid, m, a, sig)
+        #FIXME: end
 
         C = max(512 ÷ prod(size(cell)), 1)
         crbc_volume_kernel_top!(backend, (size(cell)..., C))(
@@ -729,13 +741,14 @@ function crbc_rhs!(dq, q, dwdn, dqdtan, grid, invwJ, DT, m, a, sig, cm; orient =
             q,
             dqdtan,
             dwdn,
-            m,
             Val(size(cell)),
             Val(C);
             ndrange = size(dq),
         )
     elseif orient == "bottom"
-        dwdn = crbc_recursion_bottom!(dwdn, dqdtan, q, grid, m, a, sig)
+        #FIXME: AHHHHH this is real bad
+        #dwdn = crbc_recursion_bottom!(dwdn, dqdtan, q, grid, m, a, sig)
+        #FIXME: end
 
         C = max(512 ÷ prod(size(cell)), 1)
         crbc_volume_kernel_bottom!(backend, (size(cell)..., C))(
@@ -743,7 +756,6 @@ function crbc_rhs!(dq, q, dwdn, dqdtan, grid, invwJ, DT, m, a, sig, cm; orient =
             q,
             dqdtan,
             dwdn,
-            m,
             Val(size(cell)),
             Val(C);
             ndrange = size(dq),
@@ -797,7 +809,6 @@ function rhs!(dq, q, grid, data, invwJ, DT, materialparams, bc, cm)
 end
 
 function run(
-    ic,
     FT,
     AT,
     N,
@@ -825,10 +836,9 @@ function run(
 
 
     #jl # crude dt estimate
-    #FIXME: This cfl condition should be fixed
     cfl = 1 // 20
     dx = Base.step(first(coordinates))
-    dt = cfl * dx / (11)^2
+    dt = cfl * dx / (maximum(N)+1)^2
 
     numberofsteps = ceil(Int, timeend / dt)
     energy = []
@@ -863,7 +873,8 @@ function run(
             push!(energy, e)
         end
     end
-    do_output = function (step, time, q, grid)
+
+    do_output = function (step, time, q, matparam, grid)
         if outputvtk && step % ceil(Int, timeend / 100 / dt) == 0
             cell = referencecell(grid)
             cd(vtkdir) do
@@ -871,6 +882,7 @@ function run(
                 vtkfile = vtk_grid(filename, grid)
                 P = toequallyspaced(cell)
                 vtkfile["|q|²"] = Adapt.adapt(Array, P * abs2.(q))
+               vtkfile["m"] = Adapt.adapt(Array, matparam)
                 vtk_save(vtkfile)
                 if rank == 0
                     pvd[time] = vtkfile
@@ -886,24 +898,39 @@ function run(
     #jl # precompute derivative transpose
     DT = derivatives_1d(cell)
 
+    fn(x, y) = f(x,delta_y)
+    fs(x, y) = f(x,-delta_y)
+    fe(x, y) = f(delta_x,y)
+    fw(x, y) = f(-delta_x, y)
+
     materialparams_H = zeros(size(wJ))
     gridpoints_H = adapt(Array, grid.points)
-    coefmap!(materialparams_H, gridpoints_H, m)
+
+    coefmap!(materialparams_H, gridpoints_H, f)
     materialparams = adapt(AT, materialparams_H)
 
     #jl # initialize state
-    if hasmethod(ic, Tuple{GridArray,GridArray,Number})
-        q = ic(points(grid), materialparams, 0.0)
-    elseif hasmethod(ic, Tuple{GridArray,GridArray})
-        q = ic(points(grid), materialparams)
-    else
-        q = ic.(points(grid))
-    end
+    q = GridArray{SVector{2, ComplexF64}}(undef, grid)
 
-    #jl # storage for RHS
-    #dq = similar(q)
-    #dq .= Ref(zero(eltype(q)))
     backend = Raven.get_backend(q)
+    if convergetest == true
+        exactwithinterface!(backend, (size(cell)..., 1))(
+            q,
+            points(grid),
+            materialparams,
+            0.0,
+            Val(size(cell));
+            ndrange = size(q)
+        )
+    else
+        gaussian!(backend, (size(cell)..., 1))(
+            q,
+            points(grid),
+            Val(size(cell));
+            ndrange = size(q)
+        )
+    end
+    #jl # storage for RHS
     dq = KernelAbstractions.zeros(backend, eltype(q), size(q))
 
     # adjust boundary code
@@ -925,6 +952,7 @@ function run(
     #  CRBC DATA  #
     #%%%%%%%%%%%%%#
     data = similar(q)
+    data .= Ref(zero(eltype(q)))
     if BC == :crbc
         Q = 10
         crbc_cell = LobattoCell{FT,AT}(N[1] + 1, Q + 1)
@@ -956,9 +984,10 @@ function run(
         crbc_invwJ_top = inv.(crbc_wJ_top)
         crbc_DT_top = derivatives_1d(crbc_cell)
 
-        crbc_interface_top = findall(≈(delta_y), last.(points(crbc_grid_top)))
-        bulk_interface_top = findall(≈(delta_y), last.(points(grid)))
-        #@assert points(grid)[bulk_interface_top] ≈ points(crbc_grid_top)[crbc_interface_top]
+        #FIXME: AHHHHH this is real bad
+        crbc_interface_top = findall(≈(delta_y), adapt(Array, last.(points(crbc_grid_top))))
+        bulk_interface_top = findall(≈(delta_y), adapt(Array, last.(points(grid))))
+        #FIXME: end
 
         # BOTTOM
         crbc_coordinates_bottom = (
@@ -981,9 +1010,23 @@ function run(
         crbc_invwJ_bottom = inv.(crbc_wJ_bottom)
         crbc_DT_bottom = derivatives_1d(crbc_cell)
 
-        crbc_interface_bottom = findall(≈(-delta_y), last.(points(crbc_grid_bottom)))
-        bulk_interface_bottom = findall(≈(-delta_y), last.(points(grid)))
-        #@assert points(grid)[bulk_interface_bottom] ≈ points(crbc_grid_bottom)[crbc_interface_bottom]
+        # crbc parameters
+        _, _, crbc_wJ_top = components(first(volumemetrics(crbc_grid_top)))
+        crbc_materialparams_top_H = zeros(size(crbc_wJ_top))
+        crbc_gridpoints_top_H = adapt(Array, crbc_grid_top.points)
+        coefmap!(crbc_materialparams_top_H, crbc_gridpoints_top_H, fn)
+        crbc_materialparams_top = adapt(AT, crbc_materialparams_top_H)
+
+        _, _, crbc_wJ_bottom = components(first(volumemetrics(crbc_grid_bottom)))
+        crbc_materialparams_bottom_H = zeros(size(crbc_wJ_bottom))
+        crbc_gridpoints_bottom_H = adapt(Array, crbc_grid_bottom.points)
+        coefmap!(crbc_materialparams_bottom_H, crbc_gridpoints_bottom_H, fs)
+        crbc_materialparams_bottom = adapt(AT, crbc_materialparams_bottom_H)
+
+        #FIXME: AHHHHH this is real bad
+        crbc_interface_bottom = findall(≈(-delta_y), adapt(Array, last.(points(crbc_grid_bottom))))
+        bulk_interface_bottom = findall(≈(-delta_y), adapt(Array, last.(points(grid))))
+        #FIXME: end
     end # crbc initialization
 
     #jl # initial output
@@ -994,7 +1037,7 @@ function run(
     a = matlabdata["a"]
     sig = matlabdata["sig"]
 
-    do_output(step, time, q, grid)
+    do_output(step, time, q, materialparams, grid)
 
     progress_stepwidth = cld(numberofsteps, progresswidth)
     elapsed_time = @elapsed begin
@@ -1013,9 +1056,14 @@ function run(
             if time + dt > timeend
                 dt = timeend - time
             end
-            crbc_dw1dn_top, _ = components(crbc_dwdn_top)
-            crbc_dw1dn_bottom, _ = components(crbc_dwdn_bottom)
-            q1, q2 = components(q)
+
+            if BC == :crbc
+                crbc_dwdn_top_h = Adapt.adapt(Array, crbc_dwdn_top)
+                crbc_dwdn_bottom_h = Adapt.adapt(Array, crbc_dwdn_bottom)
+            end
+
+            data_h = Adapt.adapt(Array, data)
+            q_h = Adapt.adapt(Array,q)
 
             for stage in eachindex(RKA, RKB)
                 @. dq *= RKA[stage]
@@ -1023,11 +1071,18 @@ function run(
                     @. crbc_dq_top *= RKA[stage]
                     @. crbc_dq_bottom *= RKA[stage]
 
-                    crbc_dw1dn_top[crbc_interface_top] .=
-                        q1[bulk_interface_top] - im * q2[bulk_interface_top]
-                    crbc_dw1dn_bottom[crbc_interface_bottom] .=
-                        -q1[bulk_interface_bottom] - im * q2[bulk_interface_bottom]
+                    #FIXME: AHHHHH this is real bad
+                    P = SA[1 -im; 1 im]
+                    crbc_dwdn_top_h[crbc_interface_top] .=
+                        [P * i for i in q_h[bulk_interface_top]]
 
+                    P = SA[-1 -im; -1 im]
+                    crbc_dwdn_bottom_h[crbc_interface_bottom] .=
+                        [P * i for i in q_h[bulk_interface_bottom]]
+
+                    crbc_dwdn_top = Adapt.adapt(AT, crbc_dwdn_top_h)
+                    crbc_dwdn_bottom = Adapt.adapt(AT, crbc_dwdn_bottom_h)
+                    #FIXME: end
                     crbc_rhs!(
                         crbc_dq_top,
                         crbc_q_top,
@@ -1036,7 +1091,7 @@ function run(
                         crbc_grid_top,
                         crbc_invwJ_top,
                         crbc_DT_top,
-                        m,
+                        crbc_materialparams_top,
                         a,
                         sig,
                         cm;
@@ -1051,25 +1106,37 @@ function run(
                         crbc_grid_bottom,
                         crbc_invwJ_bottom,
                         crbc_DT_bottom,
-                        matpar == :half ? -m : m,
+                        crbc_materialparams_bottom,
                         a,
                         sig,
                         cm;
                         orient = "bottom",
                     )
 
+                    #FIXME: AHHHH this is real bad
+                    crbc_dwdn_top_h  = Adapt.adapt(Array, crbc_dwdn_top)
+                    crbc_dwdn_bottom_h = Adapt.adapt(Array, crbc_dwdn_bottom)
+
                     Pinv = SA[0.5 0.5; 0.5*im -0.5*im]
-                    data[bulk_interface_top] .=
-                        [Pinv * i for i in crbc_dwdn_top[crbc_interface_top]]
+                    data_h[bulk_interface_top] .=
+                        [Pinv * i for i in crbc_dwdn_top_h[crbc_interface_top]]
 
                     Pinv = SA[-0.5 -0.5; 0.5*im -0.5*im]
-                    data[bulk_interface_bottom] .=
-                        [Pinv * i for i in crbc_dwdn_bottom[crbc_interface_bottom]]
+                    data_h[bulk_interface_bottom] .=
+                        [Pinv * i for i in crbc_dwdn_bottom_h[crbc_interface_bottom]]
+                    #FIXME: end
                 end
 
 
                 if datatype == :synthetic
-                    data = exactwithinterface(points(grid), materialparams, time)
+                    exactwithinterface!(backend, (size(cell)..., 1))(
+                        data,
+                        points(grid),
+                        materialparams,
+                        time,
+                        Val(size(cell));
+                        ndrange = size(q)
+                    )
                 end
 
                 rhs!(dq, q, grid, data, invwJ, DT, materialparams, bc, cm)
@@ -1083,7 +1150,8 @@ function run(
             end
             time += dt
 
-            do_output(step, time, q, grid)
+            #do_output(step, time, q, grid)
+            do_output(step, time, q, materialparams, grid)
             energy_output(step, energy, q, grid)
         end # time step for loop
     end # elapsed time
@@ -1097,7 +1165,7 @@ function run(
         )
     end
 
-    do_output(numberofsteps, timeend, q, grid)
+    do_output(numberofsteps, timeend, q, materialparams, grid)
     energy_output(numberofsteps, energy, q, grid)
 
     if outputvtk && rank == 0
@@ -1110,12 +1178,15 @@ function run(
         # compute error
         _, _, wJ = components(first(volumemetrics(grid)))
         qexact = similar(q)
-        if matpar == :const
-            @assert BC == :periodic "BC must be :periodic"
-            qexact .= exactwithoutinterface.(points(grid), timeend)
-        elseif matpar == :half
-            qexact .= exactwithinterface(points(grid), materialparams, timeend)
-        end
+
+        exactwithinterface!(backend, (size(cell)..., 1))(
+            qexact,
+            points(grid),
+            materialparams,
+            timeend,
+            Val(size(cell));
+            ndrange = size(q)
+        )
 
         #jl # TODO add sum to GridArray so the following reduction is on the device
         err = sqrt(sum(Adapt.adapt(Array, wJ .* abs2.(q .- qexact))))
@@ -1140,10 +1211,10 @@ let
 
     if CUDA.functional()
         CUDA.device!(MPI.Comm_rank(comm) % length(CUDA.devices()))
-        CUDA.allowscalar(true) #FIXME: AHHH!!
+        CUDA.allowscalar(true) #FIXME: AHHHH need this for recursion!!
     end
 
-    vtkdir = "vtk_semidg_dirac_2d$(K)x$(K)_L$(Lout)_$(String(BC))_$(String(matpar))_$(timeend)"
+    vtkdir = "vtk_semidg_dirac_2d$(K)x$(K)_L$(Lout)_$(String(BC))_$(timeend)"
 
     if rank == 0
         configdata = """Configuration:
@@ -1158,8 +1229,8 @@ let
             base                = $K
             level refine        = $Lout
             polynomial order    = $N
-            material param      = $(String(matpar))
             flux type           = $(String(flux))
+            matparam            = $(String(matcoef))
             m                   = $m
             bc type             = periodic x $(String(BC))
             ghost ∂Ω data type  = $(String(datatype))
@@ -1190,10 +1261,7 @@ let
             """
         end
 
-        ic = initialgaussian
-
         _, _, energy, _ = run(
-            ic,
             FT,
             AT,
             N,
@@ -1218,7 +1286,6 @@ let
     if convergetest
         rank == 0 && @info "Starting convergence study h-refinement"
         err = zeros(FT, numlevels)
-        ic = matpar == :const ? exactwithoutinterface : exactwithinterface
         @assert m > 0 "Exact solution requires m > 0"
 
         for l = 1:numlevels
@@ -1226,7 +1293,6 @@ let
             totalcells = (K * 2^L, K * 2^L)
             dofs = prod(totalcells) * prod(1 .+ N)
             _, _, _, err[l] = run(
-                ic,
                 FT,
                 AT,
                 N,
@@ -1285,9 +1351,8 @@ let
             L = l - 1
             totalcells = (K * 2^L, K * 2^L)
             dofs = prod(totalcells) * prod(1 .+ N)
-            ic = matpar == :const ? exactwithoutinterface : exactwithinterface
-            final_course, _, _, _ = run(ic, FT, AT, N, K, L; outputvtk = false, comm)
-            final_fine, grid, _, _ = run(ic, FT, AT, N, K, L + 1; outputvtk = false, comm)
+            final_course, _, _, _ = run(FT, AT, N, K, L; outputvtk = false, comm)
+            final_fine, grid, _, _ = run(FT, AT, N, K, L + 1; outputvtk = false, comm)
 
             _, _, wJ = components(first(volumemetrics(grid)))
 
