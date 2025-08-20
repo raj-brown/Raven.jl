@@ -427,7 +427,7 @@ let
 
     #jl # run convergence study using a simple sine field
     rank == 0 && @info "Starting convergence study"
-    numlevels = 5
+    numlevels = @isdefined(_testing) ? 2 : 5
     err = zeros(FT, numlevels)
     for l = 1:numlevels
         L = l - 1
@@ -443,7 +443,7 @@ let
             )
         end
     end
-    rates = log2.(err[1:numlevels-1] ./ err[2:numlevels])
+    rates = log2.(err[1:(numlevels-1)] ./ err[2:numlevels])
     if rank == 0
         @info "Convergence rates:\n" * join(
             ["rate for levels $l → $(l + 1) = $(rates[l])" for l = 1:(numlevels-1)],

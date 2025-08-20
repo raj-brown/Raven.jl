@@ -8,7 +8,7 @@ end
 
 @inline function insert(I::NTuple{N,Int}, ::Val{M}, i::Int) where {N,M}
     m = M::Int
-    return (I[1:m-1]..., i, I[m:end]...)::NTuple{N + 1,Int}
+    return (I[1:(m-1)]..., i, I[m:end]...)::NTuple{N + 1,Int}
 end
 
 """
@@ -39,6 +39,11 @@ end
 
 const GridVecOrMat{T} = Union{GridArray{T,1},GridArray{T,2}}
 
+AnyGridArray{T,N} = Union{GridArray{T,N},WrappedArray{T,N,GridArray,GridArray{T,N}}}
+AnyGridVector{T} = AnyGridArray{T,1}
+AnyGridMatrix{T} = AnyGridArray{T,2}
+AnyGridVecOrMat{T} = Union{AnyGridVector{T},AnyGridMatrix{T}}
+
 function GridArray{T}(
     ::UndefInitializer,
     ::Type{A},
@@ -48,7 +53,10 @@ function GridArray{T}(
     withghosts::Bool,
     fieldindex::Integer,
 ) where {T,A,N}
-    if !(all(dims[1:end-1] .== dimswithghosts[1:end-1]) && dims[end] <= dimswithghosts[end])
+    if !(
+        all(dims[1:(end-1)] .== dimswithghosts[1:(end-1)]) &&
+        dims[end] <= dimswithghosts[end]
+    )
         throw(
             DimensionMismatch(
                 "dims ($dims) must equal to dimswithghosts ($dimswithghosts) in all but the last dimension where it should be less than",
@@ -59,13 +67,14 @@ function GridArray{T}(
     types = flatten(recursive_fieldtypes(T), DataType)
 
     L = length(types)::Int
-    if L == 0
-        throw(ArgumentError("Type T has no Real fields"))
-    end
 
-    E = first(types)
-    if !allequal(types)
-        throw(ArgumentError("Type T has different field types: $types"))
+    if L == 0
+        E = eltype(T)
+    else
+        E = first(types)
+        if !allequal(types)
+            throw(ArgumentError("Type T has different field types: $types"))
+        end
     end
 
     datawithghosts = A{E}(undef, insert(dimswithghosts, Val(fieldindex), L))
@@ -197,8 +206,7 @@ with `A`.
 """
 @inline get_backend(::GridArray{T,N,A}) where {T,N,A} = get_backend(A)
 
-@inline GPUArraysCore.backend(x::GridArray{<:Any,<:Any,<:AbstractGPUArray}) =
-    GPUArraysCore.backend(x.datawithghosts)
+@inline KernelAbstractions.get_backend(::GridArray{T,N,A}) where {T,N,A} = get_backend(A)
 
 """
     arraytype(A::GridArray) -> DataType
@@ -267,7 +275,7 @@ function Base.similar(
     if M == N
         if (!G && (dims[end] == a.dims[end])) || (G && (dims[end] == a.dimswithghosts[end]))
             # Create ghost layer
-            dimswithghosts = (dims[1:end-1]..., a.dimswithghosts[end])
+            dimswithghosts = (dims[1:(end-1)]..., a.dimswithghosts[end])
         else
             # No ghost layer
             dimswithghosts = dims
@@ -294,6 +302,14 @@ end
         Val(L),
     )::NTuple{L,eltype(data)}
     return unflatten(T, d)
+end
+
+@inline function Base.getindex(
+    a::GridArray{T,N,A,G,F,0},
+    I::Vararg{Int,N},
+) where {T,N,A,G,F}
+    @boundscheck checkbounds(a, I)
+    return T()
 end
 
 @generated function _unsafe_setindex!(
@@ -432,8 +448,8 @@ function Base.similar(
     return GridArray{T}(
         undef,
         A,
-        (dims[1:F-1]..., elemdims...),
-        (dims[1:F-1]..., elemdimswithghosts...),
+        (dims[1:(F-1)]..., elemdims...),
+        (dims[1:(F-1)]..., elemdimswithghosts...),
         comm(a),
         G,
         F,
@@ -565,3 +581,99 @@ function components(a::GridArray{T,N,A,G,F}) where {T,N,A,G,F}
 
     return comps
 end
+
+# function Base.accumulate!(
+#     op,
+#     B::AnyGridArray,
+#     A::AnyGridArray;
+#     init = zero(eltype(A)),
+#     kwargs...,
+# )
+#     prefer_threads = false
+#     backend = get_backend(A)
+#
+#     if backend isa CPU
+#         backend = KernelAbstractions.get_backend([])
+#         prefer_threads = true
+#     end
+#
+#     AK.accumulate!(op, B, A, backend; init, prefer_threads, kwargs...)
+# end
+#
+# function Base.accumulate(op, A::AnyGridArray; init = zero(eltype(A)), kwargs...)
+#     prefer_threads = false
+#     backend = get_backend(A)
+#
+#     if backend isa CPU
+#         backend = KernelAbstractions.get_backend([])
+#         prefer_threads = true
+#     end
+#
+#     AK.accumulate(op, A, backend; init, prefer_threads, kwargs...)
+# end
+
+# XXX: The following change disables the `@Const` macro for GridArrays to
+# work around a GPU memory error encountered during AcceleratedKernels 1D
+# GPU reduction when running via CUDA. The root cause appears to be related
+# to how the `@Const` macro interacts with GridArrays and CUDA memory
+# management, potentially leading to invalid memory accesses or resource
+# exhaustion. Disabling the macro avoids these issues but may negatively
+# impact performance by preventing certain compiler optimizations.
+#
+# Rationale: This is a temporary workaround to ensure correctness when using
+# GridArrays with CUDA. Performance trade-offs were deemed acceptable given
+# the severity of the memory error.
+#
+# Eventually we should investigate the interaction between `@Const`, GridArrays,
+# and CUDA memory management to identify the root cause of the error.
+KernelAbstractions.constify(a::AnyGridArray) = a
+
+function Base.sum(src::AnyGridArray; kwargs...)
+    prefer_threads = false
+    backend = get_backend(src)
+
+    if backend isa CPU
+        backend = KernelAbstractions.get_backend([])
+        prefer_threads = true
+    end
+
+    AK.sum(src, backend; prefer_threads, kwargs...)
+end
+
+# Base.prod(src::AnyGridArray; kwargs...) = AK.prod(src; kwargs...)
+# Base.maximum(src::AnyGridArray; kwargs...) = AK.maximum(src; kwargs...)
+# Base.minimum(src::AnyGridArray; kwargs...) = AK.minimum(src; kwargs...)
+# Base.count(src::AnyGridArray; kwargs...) = AK.count(src; kwargs...)
+# Base.count(f::Function, src::AnyGridArray; kwargs...) = AK.count(f, src; kwargs...)
+# Base.cumsum(src::AnyGridArray; kwargs...) = AK.cumsum(src; kwargs...)
+# Base.cumprod(src::AnyGridArray; kwargs...) = AK.cumprod(src; kwargs...)
+
+# Base.map!(f, dst::AnyGridArray, src::AnyGridArray; kwargs...) =
+#     AK.map!(f, dst, src; kwargs...)
+# Base.map(f, src::AnyGridArray; kwargs...) = AK.map(f, src; kwargs...)
+
+# Base.any(pred::Function, v::AnyGridArray; kwargs...) = AK.any(pred, v; kwargs...)
+# function Base.all(pred::Function, v::AnyGridArray; kwargs...)
+#     AK.all(pred, v; prefer_threads = true, kwargs...)
+# end
+
+# XXX: The following code causes a `StackOverflowError`.  Something else
+# must be done to hook reductions into `Base`.
+#
+# Base.reduce(op, src::AnyGridArray; init, kwargs...) = AK.reduce(op, src; init, kwargs...)
+# Base.mapreduce(
+#     f,
+#     op,
+#     src::AnyGridArray;
+#     init = Base.mapreduce_empty(f, op, eltype(src)),
+#     kwargs...,
+# ) = AK.mapreduce(f, op, src; init, kwargs...)
+
+# Base.searchsortedfirst(v::AnyGridVector, x::AnyGridVector; kwargs...) =
+#     AK.searchsortedfirst(v::AnyGridVector, x::AnyGridVector; kwargs...)
+# Base.searchsortedlast(v::AnyGridVector, x::AnyGridVector; kwargs...) =
+#     AK.searchsortedlast(v::AnyGridVector, x::AnyGridVector; kwargs...)
+#
+# Base.sort!(x::AnyGridArray; kwargs...) = (AK.sort!(x; kwargs...); return x)
+# Base.sortperm!(ix::AnyGridArray, x::AnyGridArray; kwargs...) =
+#     (AK.sortperm!(ix, x; kwargs...); return ix)

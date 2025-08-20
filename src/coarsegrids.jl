@@ -1,10 +1,10 @@
-abstract type AbstractCoarseGrid end
-abstract type AbstractBrickGrid <: AbstractCoarseGrid end
+abstract type AbstractCoarseGrid{T,N} end
+abstract type AbstractBrickGrid{T,N} <: AbstractCoarseGrid{T,N} end
 
 isextruded(::AbstractCoarseGrid) = false
 columnlength(::AbstractCoarseGrid) = 1
 
-struct MeshImportCoarseGrid{C,V,L,W,U,M} <: AbstractCoarseGrid
+struct MeshImportCoarseGrid{T,N,C,V,L,W,U,M} <: AbstractCoarseGrid{T,N}
     connectivity::C
     vertices::V
     cells::L
@@ -24,11 +24,17 @@ function coarsegrid(meshfilename::String, warp = identity, unwarp = identity)
     cells = Raven.cells(cg_temp)
     if length(cells[begin]) == 4
         conn = P4estTypes.Connectivity{4}(vertices, cells)
+        N = 2
     elseif length(cells[begin]) == 8
         conn = P4estTypes.Connectivity{8}(vertices, cells)
+        N = 3
+    else
+        conn = nothing
+        N = 0
     end
+    T = eltype(vertices)
     C, V, L, W, U, M = typeof.([conn, vertices, cells, warp, unwarp, meshimport])
-    return MeshImportCoarseGrid{C,V,L,W,U,M}(
+    return MeshImportCoarseGrid{T,N,C,V,L,W,U,M}(
         conn,
         vertices,
         cells,
@@ -38,7 +44,7 @@ function coarsegrid(meshfilename::String, warp = identity, unwarp = identity)
     )
 end
 
-struct CoarseGrid{C,V,L,W,U} <: AbstractCoarseGrid
+struct CoarseGrid{T,N,C,V,L,W,U} <: AbstractCoarseGrid{T,N}
     connectivity::C
     vertices::V
     cells::L
@@ -61,10 +67,20 @@ function CoarseGrid(
     warp = identity,
     unwarp = identity,
 ) where {X}
+    if X == 2
+        N = 1
+    elseif X == 4
+        N = 2
+    elseif X == 8
+        N = 3
+    else
+        N = 0
+    end
 
     conn = P4estTypes.Connectivity{X}(vertices, cells)
+    T = eltype(vertices)
     C, V, L, W, U = typeof.([conn, vertices, cells, warp, unwarp])
-    return CoarseGrid{C,V,L,W,U}(conn, vertices, cells, warp, unwarp)
+    return CoarseGrid{T,N,C,V,L,W,U}(conn, vertices, cells, warp, unwarp)
 end
 
 function coarsegrid(vertices, cells, warp = identity, unwarp = identity)
@@ -214,7 +230,7 @@ function cubeshell2dgrid(R::Real)
     return coarsegrid(vertices, cells, cubespherewarp, cubesphereunwarp)
 end
 
-struct BrickGrid{T,N,C,D,P} <: AbstractBrickGrid
+struct BrickGrid{T,N,C,D,P} <: AbstractBrickGrid{T,N}
     connectivity::C
     coordinates::D
     isperiodic::P
@@ -224,6 +240,13 @@ Base.ndims(::BrickGrid{T,N}) where {T,N} = N
 connectivity(g::BrickGrid) = g.connectivity
 coordinates(g::BrickGrid) = g.coordinates
 isperiodic(g::BrickGrid) = g.isperiodic
+
+function vertices(g::BrickGrid{T,1}) where {T}
+    coords = coordinates(g)
+    verts = [SVector(coords[1][i]) for i in eachindex(coords[1])]
+
+    return verts
+end
 
 function vertices(g::BrickGrid{T,2}) where {T}
     conn = connectivity(g)
@@ -246,9 +269,26 @@ function vertices(g::BrickGrid{T,3}) where {T}
     return verts
 end
 
+function cells(g::BrickGrid{T,1}) where {T}
+    n = length(only(coordinates(g))) - 1
+
+    return [(i, i + 1) for i = 1:n]
+end
+
 function cells(g::BrickGrid)
     conn = connectivity(g)
     GC.@preserve conn map.(x -> x + 1, P4estTypes.unsafe_trees(conn))
+end
+
+function BrickGrid{T}(coordinates::NTuple{1}, p::NTuple{1}) where {T}
+    N = length(coordinates)
+    connectivity = nothing
+
+    return BrickGrid{T,N,typeof(connectivity),typeof(coordinates),typeof(p)}(
+        connectivity,
+        coordinates,
+        p,
+    )
 end
 
 function BrickGrid{T}(coordinates, p) where {T}
@@ -267,6 +307,11 @@ function brick(::Type{T}, coordinates, p) where {T}
     return BrickGrid{T}(coordinates, p)
 end
 
+function brick(coordinates::Tuple{<:Any}, p::Tuple{Bool} = (false,))
+    T = promote_type(eltype.(coordinates)...)
+    return brick(T, coordinates, p)
+end
+
 function brick(coordinates::Tuple{<:Any,<:Any}, p::Tuple{Bool,Bool} = (false, false))
     T = promote_type(eltype.(coordinates)...)
     return brick(T, coordinates, p)
@@ -277,6 +322,11 @@ function brick(
     p::Tuple{Bool,Bool,Bool} = (false, false, false),
 )
     T = promote_type(eltype.(coordinates)...)
+    return brick(T, coordinates, p)
+end
+
+function brick(T::Type, n::Tuple{Integer}, p::Tuple{Bool} = (false,))
+    coordinates = (zero(T):n[1],)
     return brick(T, coordinates, p)
 end
 
@@ -294,6 +344,10 @@ function brick(
     return brick(T, coordinates, p)
 end
 
+function brick(n::Tuple{Integer}, p::Tuple{Bool} = (false,))
+    return brick(Float64, n, p)
+end
+
 function brick(n::Tuple{Integer,Integer}, p::Tuple{Bool,Bool} = (false, false))
     return brick(Float64, n, p)
 end
@@ -304,6 +358,10 @@ function brick(
 )
     return brick(Float64, n, p)
 end
+
+brick(a::AbstractArray, p::Bool = false) = brick((a,), (p,))
+brick(l::Integer, p::Bool = false) = brick(Float64, (l,), (p,))
+brick(T::Type, l::Integer, p::Bool = false) = brick(T, (l,), (p,))
 
 brick(a::AbstractArray, b::AbstractArray, p::Bool = false, q::Bool = false) =
     brick((a, b), (p, q))
@@ -346,7 +404,7 @@ function brick(
     return brick(T, (l, m, n), (p, q, r))
 end
 
-struct ExtrudedBrickGrid{T,N,B,E} <: AbstractBrickGrid
+struct ExtrudedBrickGrid{T,N,B,E} <: AbstractBrickGrid{T,N}
     basegrid::B
     coordinates::E
     isperiodic::Bool
@@ -376,6 +434,17 @@ connectivity(g::ExtrudedBrickGrid) = connectivity(parent(g))
 coordinates(g::ExtrudedBrickGrid) = (coordinates(parent(g))..., g.coordinates)
 isperiodic(g::ExtrudedBrickGrid) = (isperiodic(parent(g))..., g.isperiodic)
 
+function vertices(g::ExtrudedBrickGrid{T,2}) where {T}
+    coords = coordinates(g)
+
+    verts = vec([
+        SVector(coords[1][i], coords[2][j]) for
+        j in eachindex(coords[2]), i in eachindex(coords[1])
+    ])
+
+    return verts
+end
+
 function vertices(g::ExtrudedBrickGrid{T,3}) where {T}
     conn = connectivity(g)
     coords = coordinates(g)
@@ -389,6 +458,21 @@ function vertices(g::ExtrudedBrickGrid{T,3}) where {T}
     ])
 
     return verts
+end
+
+function cells(g::ExtrudedBrickGrid{T,2}) where {T}
+    coords = coordinates(g)
+    n, m = length.(coords)
+
+    L = LinearIndices((m, n))
+
+    c = Matrix{NTuple{4,Int}}(undef, m - 1, n - 1)
+
+    for j = 1:(m-1), i = 1:(n-1)
+        c[j, i] = (L[j, i], L[j, i+1], L[j+1, i], L[j+1, i+1])
+    end
+
+    return vec(c)
 end
 
 function cells(g::ExtrudedBrickGrid{T,3}) where {T}

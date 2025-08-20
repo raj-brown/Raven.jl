@@ -9,6 +9,7 @@ using Raven.StaticArrays
 using Raven.SparseArrays
 using Test
 using Aqua
+using SafeTestsets
 
 Aqua.test_all(Raven; stale_deps = (ignore = [:Requires],))
 
@@ -44,7 +45,8 @@ function runmpitests()
         @info "Running MPI tests..."
         @testset "$f" for f in testfiles
             nprocs = parse(Int, first(match(r"_n(\d*)_", f).captures))
-            cmd = `$(mpiexec()) -n $nprocs $(Base.julia_cmd()) --startup-file=no --project=$tmp_project $(joinpath(test_dir, f))`
+            cmd =
+                `$(mpiexec()) -n $nprocs $(Base.julia_cmd()) --startup-file=no --project=$tmp_project $(joinpath(test_dir, f))`
             @test success(pipeline(cmd, stderr = stderr, stdout = stdout))
         end
     end
@@ -59,6 +61,50 @@ include("gridnumbering.jl")
 include("orientation.jl")
 include("sparsearrays.jl")
 
+@testset "Balance Laws" begin
+    @testset "Advection" begin
+        @safetestset "entropy conservation 1d" begin
+            include("balancelaws/advection/entropy_conservation_1d.jl")
+        end
+        @safetestset "wave 1d" begin
+            include("balancelaws/advection/wave_1d.jl")
+        end
+        @safetestset "wave 2d" begin
+            include("balancelaws/advection/wave_2d.jl")
+        end
+        @safetestset "wave 3d" begin
+            include("balancelaws/advection/wave_3d.jl")
+        end
+    end
+
+    @testset "Euler" begin
+        @safetestset "isentropic vortex" begin
+            include("balancelaws/euler/isentropicvortex.jl")
+        end
+        @safetestset "entropy conservation 1d" begin
+            include("balancelaws/euler/entropy_conservation_1d.jl")
+        end
+        @safetestset "wave 1d" begin
+            include("balancelaws/euler/wave_1d.jl")
+        end
+        @safetestset "wave 2d" begin
+            include("balancelaws/euler/wave_2d.jl")
+        end
+        @safetestset "wave 3d" begin
+            include("balancelaws/euler/wave_3d.jl")
+        end
+    end
+
+    @testset "Multilayer Shallow Water" begin
+        @safetestset "well balanced 1d" begin
+            include("balancelaws/multilayer_shallow_water/well_balanced_1d.jl")
+        end
+        @safetestset "manufactured 1d" begin
+            include("balancelaws/multilayer_shallow_water/manufactured_1d.jl")
+        end
+    end
+end
+
 include("testsuite.jl")
 
 Testsuite.testsuite(Array, Float64)
@@ -69,6 +115,45 @@ if CUDA.functional()
     CUDA.versioninfo()
     CUDA.allowscalar(false)
     Testsuite.testsuite(CuArray, Float32)
+end
+
+@testset "examples" begin
+    base_dir = joinpath(@__DIR__, "..")
+
+    test_examples = abspath.(
+        joinpath.(
+            base_dir,
+            [
+                "examples/advection",
+                "examples/balancelaws/euler",
+                "examples/balancelaws/euler_gravity",
+                "examples/balancelaws/shallow_water",
+            ],
+        ),
+    )
+
+    for example_dir in test_examples
+        @testset "$example_dir" begin
+            mktempdir() do tmp_dir
+                # Change to temporary directory so that any files created by the
+                # example get cleaned up after execution.
+                cd(tmp_dir)
+                example_project = Pkg.Types.projectfile_path(example_dir)
+                tmp_project = Pkg.Types.projectfile_path(tmp_dir)
+                cp(example_project, tmp_project)
+
+                for script in
+                    filter!(s -> endswith(s, ".jl"), readdir(example_dir, join = true))
+                    cmd =
+                        `$(Base.julia_cmd()) --startup-file=no --project=$tmp_project -e "import Pkg; Pkg.develop(path=raw\"$base_dir\"); Pkg.instantiate()"`
+                    @test success(pipeline(cmd, stderr = stderr, stdout = stdout))
+                    cmd =
+                        `$(mpiexec()) -n 2 $(Base.julia_cmd()) --startup-file=no --project=$tmp_project -e "const _testing = true; include(raw\"$script\")"`
+                    @test success(pipeline(cmd, stderr = stderr, stdout = stdout))
+                end
+            end
+        end
+    end
 end
 
 runmpitests()

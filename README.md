@@ -1,4 +1,4 @@
-# Raven 𓅂
+# Raven 🐦‍⬛
 <p align="center">
   <a href="https://HorribleSanity.github.io/Raven.jl/dev/">Documentation</a> •
   <a href="#contributing">Contributing</a>
@@ -12,7 +12,7 @@ devices (via
 [MPI](https://github.com/JuliaParallel/MPI.jl)).
 
 Some of our previous efforts in this area resulted in
-[Canary](https://github.com/Clima/Canary.jl),
+[Canary](https://github.com/jkozdon/Canary.jl),
 [Bennu](https://github.com/lcw/Bennu.jl), and
 [Atum](https://github.com/mwarusz/Atum.jl).
 

@@ -21,17 +21,26 @@ jobs:
     strategy:
       matrix:
         version:
-          - '^1.9.0-0'
-          - '^1.10.0-0'
+          - '~1.10.10'
+          - '^1.12.0-0'
         os:
-          - ubuntu-latest
-          - macOS-latest
-          - windows-latest
-        arch:
-          - x64
+          - ubuntu-24.04
+          - macOS-15
+          # - windows-latest
+        arch: ['x64', 'arm64']
+        exclude:
+          - os: ubuntu-24.04
+            arch: arm64
+          # macOS 13 is Intel-only, while macOS 14+ only support Apple Silicon
+          - os: macOS-15
+            arch: x64
+          - os: macOS-14
+            arch: x64
+          - os: macOS-13
+            arch: arm64
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: julia-actions/setup-julia@v2
         with:
           arch: ${{ matrix.arch }}
@@ -44,14 +53,15 @@ jobs:
 
   test-system-apt:
     timeout-minutes: 60
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         mpi:
           - libmpich-dev
           - libopenmpi-dev
         julia_version:
-          - "1.10"
+          - '~1.10.10'
+          - '^1.12.0-0'
       fail-fast: false
     env:
       P4ESTTYPES_TEST: P4ESTTYPES_CUSTOM_MPI_CUSTOM
@@ -62,7 +72,7 @@ jobs:
       OMPI_MCA_rmaps_base_oversubscribe: true
       PRTE_MCA_rmaps_default_mapping_policy: :oversubscribe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install MPI via apt
         run: |
           sudo apt-get update
