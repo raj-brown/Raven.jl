@@ -13,6 +13,9 @@ using Printf
 using Raven
 using StaticArrays
 using WriteVTK
+using KernelAbstractions
+using KernelAbstractions.Extras: @unroll
+
 
 const outputvtk = false
 
@@ -43,21 +46,21 @@ function initialcondition(x::SVector{2}, time)
 
 
 function rhs_volume_kernel!(dq, q, dRdX, wJ, invwJ, DT, ::Val{N}, ::Val{C}) where {N,C}
-    i, j, cl = threadIdx()
-    c = (blockIdx().x - 1) * blockDim().z + cl
+    i, j, cl = @index(Local, NTuple)
+    _, _, c =  @index(Global,NTuple)
 
-    lDT1 = CuStaticSharedArray(Float64, (N[1], N[1]))
-    lDT2 = CuStaticSharedArray(Float64, (N[2], N[2]))
+    lDT₁ = @localmem eltype(q) (N[1], N[1])
+    lDT₂ = @localmem eltype(q) (N[2], N[2])
 
-    lf₁ = CuStaticSharedArray(Float64, (N..., C))
-    lf₂ = CuStaticSharedArray(Float64, (N..., C))
-    lf₃ = CuStaticSharedArray(Float64, (N..., C))
-    lf₄ = CuStaticSharedArray(Float64, (N..., C))
+    lf₁ = @localmem eltype(q) (N..., C)
+    lf₂ = @localmem eltype(q) (N..., C)
+    lf₃ = @localmem eltype(q) (N..., C)
+    lf₄ = @localmem eltype(q) (N..., C)
 
-    lg₁ = CuStaticSharedArray(Float64, (N..., C))
-    lg₂ = CuStaticSharedArray(Float64, (N..., C))
-    lg₃ = CuStaticSharedArray(Float64, (N..., C))
-    lg₄ = CuStaticSharedArray(Float64, (N..., C))
+    lg₁ = @localmem eltype(q) (N..., C)
+    lg₂ = @localmem eltype(q) (N..., C)
+    lg₃ = @localmem eltype(q) (N..., C)
+    lg₄ = @localmem eltype(q) (N..., C)
 
     @inbounds begin
         for sj = 0x0:N[2]:(N[1]-0x1)
@@ -78,7 +81,7 @@ function rhs_volume_kernel!(dq, q, dRdX, wJ, invwJ, DT, ::Val{N}, ::Val{C}) wher
         u = ρu/ρ
         v = ρv/ρ
         e = q[i, j, 0x4, c]
-        p = (gamma -1)*(e - 0.5*(ru*u + rv*v))
+        p = (γ -1)*(e - 0.5*(ρu*u + ρv*v))
 
         lf₁[i, j, cl] = ρu
         lf₂[i, j, cl] = ρu*u + p        
@@ -100,41 +103,49 @@ function rhs_volume_kernel!(dq, q, dRdX, wJ, invwJ, DT, ::Val{N}, ::Val{C}) wher
         df₂_update = zero(eltype(dq))
         df₃_update = zero(eltype(dq))
         df₄_update = zero(eltype(dq))
-
-        dg₁_update = zero(eltype(dq))
-        dg₂_update = zero(eltype(dq))
-        dg₃_update = zero(eltype(dq))
-        dg₄_update = zero(eltype(dq))
-
-        duxijc_update = zero(eltype(dq))
-        duyijc_update = zero(eltype(dq))
         invwJijc = invwJ[i, j, 0x1, c]
-
         wJijc = wJ[i, j, 0x1, c]
 
+        #dρdt = rₓDᵣ(ρu) + sₓD(ρu)
+        
+        
         #dpdt = -c ((r_x D_r + s_x D_s) ux + (r_y D_r + s_y D_s) uy)
         #duxdt = -c p_x = -c (r_x D_r + s_x D_s) p
         #duydt = -c p_y = -c (r_y D_r + s_y D_s) p
 
         for m = 0x1:N[1]
-            dpijc_update -= dRdX[i, j, 0x1, c] * lDT1[i, m] * lux[m, j, cl] # -rₓDᵣuₓ
-            dpijc_update -= dRdX[i, j, 0x3, c] * lDT1[i, m] * luy[m, j, cl] # -rᵥDᵣuᵥ
+            df₁_update += dRdX[i, j, 0x1, c] * lDT1[i, m] * lf₁[m, j, cl] # rₓ(Dᵣρu)
+            df₁_update += dRdX[i, j, 0x3, c] * lDT1[i, m] * lg₁[m, j, cl] # rᵥ(Dᵣρv)
 
-            duxijc_update -= dRdX[i, j, 0x1, c] * lDT1[i, m] * lp[m, j, cl]  # -rₓDᵣp
-            duyijc_update -= dRdX[i, j, 0x3, c] * lDT1[i, m] * lp[m, j, cl]  # -rᵥDᵣp
+            df₂_update += dRdX[i, j, 0x1, c] * lDT1[i, m] * lf₂[m, j, cl] # rₓDᵣ(ρu²+p) 
+            df₂_update += dRdX[i, j, 0x3, c] * lDT1[i, m] * lg₂[m, j, cl] # rᵥDᵣ(ρuv) 
+
+            df₃_update += dRdX[i, j, 0x1, c] * lDT1[i, m] * lf₃[m, j, cl] # rₓDᵣ(ρuv)
+            df₃_update += dRdX[i, j, 0x3, c] * lDT1[i, m] * lg₃[m, j, cl] # rᵥDᵣ(ρv²+p)
+
+            df₄_update += dRdX[i, j, 0x1, c] * lDT1[i, m] * lf₄[m, j, cl] # rₓDᵣ(u[E+p])
+            df₄_update += dRdX[i, j, 0x3, c] * lDT1[i, m] * lg₄[m, j, cl] # rᵥDᵣ(v[E+p])
         end
 
         for n = 0x1:N[2]
-            dpijc_update -= dRdX[i, j, 0x2, c] * lDT2[j, n] * lux[i, n, cl] # -sₓDₛuₓ
-            dpijc_update -= dRdX[i, j, 0x4, c] * lDT2[j, n] * luy[i, n, cl] # -sᵥDₛuᵥ
+            df₁_update += dRdX[i, j, 0x2, c] * lDT2[j, n] * lf₁[i, n, cl] #  sₓDₛ(ρu)
+            df₁_update += dRdX[i, j, 0x4, c] * lDT2[j, n] * lg₁[i, n, cl] #  sᵥDₛ(ρv)
 
-            duxijc_update -= dRdX[i, j, 0x2, c] * lDT2[j, n] * lp[i, n, cl]  # -sₓDₛp
-            duyijc_update -= dRdX[i, j, 0x4, c] * lDT2[j, n] * lp[i, n, cl]  # -sᵥDₛp
+            df₂_update += dRdX[i, j, 0x2, c] * lDT2[j, n] * lf₂[i, n, cl] #  sₓDₛ(ρu²+p)
+            df₂_update += dRdX[i, j, 0x4, c] * lDT2[j, n] * lg₂[i, n, cl] #  sᵥDₛ(ρuv)
+
+            df₃_update += dRdX[i, j, 0x2, c] * lDT2[j, n] * lf₃[i, n, cl] #  sₓDₛ(ρuv)
+            df₃_update += dRdX[i, j, 0x4, c] * lDT2[j, n] * lg₃[i, n, cl] #  sᵥDₛ(ρv²+p)
+
+            df₄_update += dRdX[i, j, 0x2, c] * lDT2[j, n] * lf₄[i, n, cl] #  sₓDₛ(u[E+p])
+            df₄_update += dRdX[i, j, 0x4, c] * lDT2[j, n] * lg₄[i, n, cl] #  sᵥDₛ(v[E+p])         
         end
 
-        dq[i, j, 0x1, c] += wJijc * invwJijc * dpijc_update
-        dq[i, j, 0x2, c] += wJijc * invwJijc * duxijc_update
-        dq[i, j, 0x3, c] += wJijc * invwJijc * duyijc_update
+        dq[i, j, 0x1, c] += wJijc * invwJijc * df₁_update
+        dq[i, j, 0x2, c] += wJijc * invwJijc * df₂_update
+        dq[i, j, 0x3, c] += wJijc * invwJijc * df₃_update
+        dq[i, j, 0x4, c] += wJijc * invwJijc * df₄_update
+
     end
 
     return nothing
